@@ -3,6 +3,11 @@ export interface ImageEntry {
   name: string;
 }
 
+export interface ImageListing {
+  images: ImageEntry[];
+  totalRemaining: number;
+}
+
 export interface MoveOutcome {
   originalName: string;
   movedTo: string | null;
