@@ -37,6 +37,21 @@ fn is_image_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Walks `dir` and its subfolders, appending every qualifying image path found.
+fn collect_images(dir: &Path, results: &mut Vec<PathBuf>) {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_images(&path, results);
+        } else if path.is_file() && is_image_file(&path) {
+            results.push(path);
+        }
+    }
+}
+
 #[tauri::command]
 pub fn list_images(app: AppHandle, folder: String, limit: usize) -> Result<ImageListing, String> {
     let dir = PathBuf::from(&folder);
@@ -44,34 +59,29 @@ pub fn list_images(app: AppHandle, folder: String, limit: usize) -> Result<Image
         return Err(format!("'{folder}' is not a valid directory"));
     }
 
-    let mut entries: Vec<(String, PathBuf)> = fs::read_dir(&dir)
-        .map_err(|e| format!("Failed to read directory: {e}"))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_image_file(path))
-        .filter_map(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| (name.to_string(), path.clone()))
-        })
-        .collect();
+    let mut paths = Vec::new();
+    collect_images(&dir, &mut paths);
+    paths.sort();
 
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let total_remaining = entries.len();
-    entries.truncate(limit);
+    let total_remaining = paths.len();
+    paths.truncate(limit);
 
     // The user picks folders at runtime via a dialog, so the asset protocol
-    // has no static scope for them; grant access to this folder on every list.
+    // has no static scope for them; grant access (including subfolders,
+    // since images can come from anywhere under this folder) on every list.
     app.asset_protocol_scope()
-        .allow_directory(&dir, false)
+        .allow_directory(&dir, true)
         .map_err(|e| format!("Failed to grant asset access: {e}"))?;
 
     Ok(ImageListing {
-        images: entries
+        images: paths
             .into_iter()
-            .map(|(name, path)| ImageEntry {
-                path: path.to_string_lossy().to_string(),
-                name,
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?.to_string();
+                Some(ImageEntry {
+                    path: path.to_string_lossy().to_string(),
+                    name,
+                })
             })
             .collect(),
         total_remaining,
