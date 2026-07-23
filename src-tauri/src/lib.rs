@@ -8,7 +8,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             commands::list_images,
-            commands::move_images
+            commands::move_images,
+            commands::move_to_finished
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

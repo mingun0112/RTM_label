@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import { FolderBar } from "./components/FolderBar";
 import { ImageGrid } from "./components/ImageGrid";
-import { listImages, moveImages } from "./lib/commands";
+import { listImages, moveImages, moveToFinished } from "./lib/commands";
 import { loadSettings, saveSettings } from "./lib/settingsStore";
 import { DEFAULT_SETTINGS, type ImageEntry, type Settings } from "./types";
 
@@ -11,24 +11,35 @@ function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [images, setImages] = useState<ImageEntry[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [remainingCount, setRemainingCount] = useState<number | null>(null);
+  // Snapshot of remainingCount taken when a folder is (re)registered, used as
+  // the baseline for the progress bar so it doesn't reset on every refresh.
+  const [sessionStartCount, setSessionStartCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
-  const refreshImages = useCallback(async (folder: string, displayCount: number) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const entries = await listImages(folder, displayCount);
-      setImages(entries);
-      setSelected(new Set());
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const refreshImages = useCallback(
+    async (folder: string, displayCount: number, resetSession: boolean) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const listing = await listImages(folder, displayCount);
+        setImages(listing.images);
+        setSelected(new Set());
+        setRemainingCount(listing.totalRemaining);
+        if (resetSession) {
+          setSessionStartCount(listing.totalRemaining);
+        }
+      } catch (err) {
+        setError(String(err));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     (async () => {
@@ -36,7 +47,7 @@ function App() {
       setSettings(saved);
       setReady(true);
       if (saved.sourceFolder) {
-        await refreshImages(saved.sourceFolder, saved.displayCount);
+        await refreshImages(saved.sourceFolder, saved.displayCount, true);
       }
     })();
   }, [refreshImages]);
@@ -51,7 +62,7 @@ function App() {
     if (typeof picked !== "string") return;
     const next = { ...settings, sourceFolder: picked };
     await updateSettings(next);
-    await refreshImages(picked, next.displayCount);
+    await refreshImages(picked, next.displayCount, true);
   }, [settings, updateSettings, refreshImages]);
 
   const handlePickTarget = useCallback(async () => {
@@ -65,7 +76,7 @@ function App() {
       const next = { ...settings, displayCount: count };
       await updateSettings(next);
       if (next.sourceFolder) {
-        await refreshImages(next.sourceFolder, count);
+        await refreshImages(next.sourceFolder, count, false);
       }
     },
     [settings, updateSettings, refreshImages],
@@ -89,26 +100,47 @@ function App() {
     setError(null);
     setStatusMessage(null);
     try {
-      const outcomes = await moveImages(Array.from(selected), settings.targetFolder);
-      const movedCount = outcomes.filter((o) => !o.error).length;
-      const renamedCount = outcomes.filter((o) => !o.error && o.renamed).length;
-      const failedCount = outcomes.filter((o) => o.error).length;
-      const parts = [`${movedCount}개 이동됨`];
+      const selectedPaths = Array.from(selected);
+      const unselectedPaths = images
+        .filter((image) => !selected.has(image.path))
+        .map((image) => image.path);
+
+      const [transferOutcomes, finishedOutcomes] = await Promise.all([
+        moveImages(selectedPaths, settings.targetFolder),
+        unselectedPaths.length > 0 ? moveToFinished(unselectedPaths) : Promise.resolve([]),
+      ]);
+
+      const movedCount = transferOutcomes.filter((o) => !o.error).length;
+      const renamedCount = transferOutcomes.filter((o) => !o.error && o.renamed).length;
+      const finishedCount = finishedOutcomes.filter((o) => !o.error).length;
+      const failedCount =
+        transferOutcomes.filter((o) => o.error).length +
+        finishedOutcomes.filter((o) => o.error).length;
+
+      const parts = [`${movedCount}개 전송됨`];
       if (renamedCount > 0) parts.push(`${renamedCount}개 이름 변경`);
+      if (finishedCount > 0) parts.push(`${finishedCount}개 검토 완료`);
       if (failedCount > 0) parts.push(`${failedCount}개 실패`);
       setStatusMessage(parts.join(", "));
 
       if (settings.sourceFolder) {
-        await refreshImages(settings.sourceFolder, settings.displayCount);
+        await refreshImages(settings.sourceFolder, settings.displayCount, false);
       }
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading(false);
     }
-  }, [settings, selected, refreshImages]);
+  }, [settings, selected, images, refreshImages]);
 
   const canTransfer = settings.targetFolder !== null && selected.size > 0 && !loading;
+
+  const processedCount =
+    sessionStartCount !== null ? sessionStartCount - (remainingCount ?? sessionStartCount) : 0;
+  const progressPct =
+    sessionStartCount !== null && sessionStartCount > 0
+      ? Math.min(100, (processedCount / sessionStartCount) * 100)
+      : 0;
 
   return (
     <div className="flex h-screen flex-col bg-white text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100">
@@ -119,6 +151,25 @@ function App() {
         onDisplayCountChange={handleDisplayCountChange}
         disabled={!ready || loading}
       />
+
+      {remainingCount !== null && (
+        <div className="border-b border-neutral-200 px-4 py-2 dark:border-neutral-800">
+          <div className="mb-1 flex items-center justify-between text-xs text-neutral-500 dark:text-neutral-400">
+            <span>라벨링 진행도</span>
+            <span>
+              {sessionStartCount ? `${processedCount} / ${sessionStartCount} 처리` : null}
+              {sessionStartCount ? " · " : null}
+              폴더에 {remainingCount}장 남음
+            </span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+            <div
+              className="h-full rounded-full bg-blue-500 transition-all"
+              style={{ width: `${progressPct}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       <div className="flex items-center justify-between gap-4 px-4 py-2">
         <div className="text-sm text-neutral-500 dark:text-neutral-400">

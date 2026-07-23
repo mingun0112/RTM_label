@@ -4,12 +4,21 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp"];
+const FINISHED_DIR_NAME: &str = "finished";
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageEntry {
     pub path: String,
     pub name: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageListing {
+    pub images: Vec<ImageEntry>,
+    /// Total number of qualifying images left in the folder, before `limit` is applied.
+    pub total_remaining: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -29,7 +38,7 @@ fn is_image_file(path: &Path) -> bool {
 }
 
 #[tauri::command]
-pub fn list_images(app: AppHandle, folder: String, limit: usize) -> Result<Vec<ImageEntry>, String> {
+pub fn list_images(app: AppHandle, folder: String, limit: usize) -> Result<ImageListing, String> {
     let dir = PathBuf::from(&folder);
     if !dir.is_dir() {
         return Err(format!("'{folder}' is not a valid directory"));
@@ -48,6 +57,7 @@ pub fn list_images(app: AppHandle, folder: String, limit: usize) -> Result<Vec<I
         .collect();
 
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let total_remaining = entries.len();
     entries.truncate(limit);
 
     // The user picks folders at runtime via a dialog, so the asset protocol
@@ -56,13 +66,16 @@ pub fn list_images(app: AppHandle, folder: String, limit: usize) -> Result<Vec<I
         .allow_directory(&dir, false)
         .map_err(|e| format!("Failed to grant asset access: {e}"))?;
 
-    Ok(entries
-        .into_iter()
-        .map(|(name, path)| ImageEntry {
-            path: path.to_string_lossy().to_string(),
-            name,
-        })
-        .collect())
+    Ok(ImageListing {
+        images: entries
+            .into_iter()
+            .map(|(name, path)| ImageEntry {
+                path: path.to_string_lossy().to_string(),
+                name,
+            })
+            .collect(),
+        total_remaining,
+    })
 }
 
 /// Finds an available path in `target_dir` for `file_name`, appending
@@ -104,14 +117,8 @@ fn move_file(source: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn move_images(paths: Vec<String>, target_dir: String) -> Result<Vec<MoveOutcome>, String> {
-    let target = PathBuf::from(&target_dir);
-    if !target.is_dir() {
-        return Err(format!("'{target_dir}' is not a valid directory"));
-    }
-
-    let outcomes = paths
+fn move_files_to(paths: Vec<String>, target: &Path) -> Vec<MoveOutcome> {
+    paths
         .into_iter()
         .map(|path_str| {
             let source = PathBuf::from(&path_str);
@@ -127,7 +134,7 @@ pub fn move_images(paths: Vec<String>, target_dir: String) -> Result<Vec<MoveOut
                 }
             };
 
-            let (dest, renamed) = unique_dest_path(&target, &file_name);
+            let (dest, renamed) = unique_dest_path(target, &file_name);
 
             match move_file(&source, &dest) {
                 Ok(()) => MoveOutcome {
@@ -144,7 +151,30 @@ pub fn move_images(paths: Vec<String>, target_dir: String) -> Result<Vec<MoveOut
                 },
             }
         })
-        .collect();
+        .collect()
+}
 
-    Ok(outcomes)
+#[tauri::command]
+pub fn move_images(paths: Vec<String>, target_dir: String) -> Result<Vec<MoveOutcome>, String> {
+    let target = PathBuf::from(&target_dir);
+    if !target.is_dir() {
+        return Err(format!("'{target_dir}' is not a valid directory"));
+    }
+    Ok(move_files_to(paths, &target))
+}
+
+/// The "finished" folder sits next to the running executable, so images
+/// reviewed but not transferred are physically moved out of the source
+/// folder and won't reappear as duplicates the next time the app starts.
+#[tauri::command]
+pub fn move_to_finished(paths: Vec<String>) -> Result<Vec<MoveOutcome>, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("Failed to resolve executable path: {e}"))?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| "Failed to resolve executable directory".to_string())?;
+    let finished_dir = exe_dir.join(FINISHED_DIR_NAME);
+    fs::create_dir_all(&finished_dir)
+        .map_err(|e| format!("Failed to create finished folder: {e}"))?;
+
+    Ok(move_files_to(paths, &finished_dir))
 }
